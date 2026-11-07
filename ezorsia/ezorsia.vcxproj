@@ -171,6 +171,7 @@
     <ClInclude Include="AddyLocations.h">
       <FileType>CppHeader</FileType>
     </ClInclude>
+    <ClInclude Include="AgentBridge.h" />
     <ClInclude Include="BossHP.h" />
     <ClInclude Include="HpMpAlert.h" />
     <ClInclude Include="Client.h" />
@@ -211,6 +212,7 @@
     <ClInclude Include="targetver.h" />
   </ItemGroup>
   <ItemGroup>
+    <ClCompile Include="AgentBridge.cpp" />
     <ClCompile Include="BossHP.cpp" />
     <ClCompile Include="HpMpAlert.cpp" />
     <ClCompile Include="Client.cpp" />

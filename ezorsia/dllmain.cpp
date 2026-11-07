@@ -8,6 +8,7 @@
 #include "BossHP.h"
 #include "HpMpAlert.h"
 #include "SelectCharMacFix.h"
+#include "AgentBridge.h"
 #pragma comment(lib, "ws2_32.lib")
 
 // config.ini can use IP or hostname (ServerIP_Address=...).
@@ -139,6 +140,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD  ul_reason_for_call, LPVOID lpReser
 		Client::DeleteChar();
 		std::cout << "GetModuleFileName hook created" << std::endl;
 		ijl15::CreateHook(); //NMCO::CreateHook();
+		if (!AgentBridge::Install()) std::cerr << "Agent bridge initialization failed" << std::endl;
 
 		std::cout << "NMCO hook initialized" << std::endl;
 		break;
