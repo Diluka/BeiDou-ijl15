@@ -67,6 +67,7 @@ GameState previousState;
 std::uint64_t sceneGeneration = 1;
 std::uint64_t sequence = 0;
 std::uint64_t inputEvents = 0;
+MapleControl::ActionResult semanticResult;
 ULONGLONG deadline = 0;
 ULONGLONG lastPublishedAt = 0;
 
@@ -105,9 +106,9 @@ std::string Utf8Name(const char* name, int length) {
     return result;
 }
 
-bool SecureMap(std::uint32_t field, std::uint32_t& map) {
+bool SecureValue(std::uintptr_t address, std::uint32_t& map) {
     std::array<unsigned char, 12> guards{};
-    if (!ReadAt(field + 0x138, guards)) return false;
+    if (!ReadAt(address, guards)) return false;
     std::uint32_t pointer = 0;
     std::memcpy(&pointer, guards.data() + 8, sizeof(pointer));
     std::array<unsigned char, 10> encrypted{};
@@ -180,12 +181,86 @@ bool CaptureMonsters(std::vector<AgentBridge::MonsterState>& monsters) {
         after == membership;
 }
 
+bool CaptureInventory(std::uint32_t stats, std::vector<MapleControl::Item>& inventory) {
+    for (int type = 1; type <= 5; ++type) {
+        std::uint32_t array = 0;
+        std::uint32_t length = 0;
+        if (!ReadAt(stats + 0x447 + type * 4, array) || array == 0 ||
+            !ReadAt(array - 4, length) || length == 0 || length > 257) return false;
+        for (std::uint32_t slot = 1; slot < length; ++slot) {
+            std::uint32_t object = 0;
+            if (!ReadAt(array + slot * 8 + 4, object)) return false;
+            if (object == 0) continue;
+            std::uint32_t vtable = 0;
+            MapleControl::Item item;
+            item.inventoryType = type;
+            item.slot = static_cast<int>(slot);
+            if (!ReadAt(object, vtable) ||
+                (vtable != 0x00AF310C && vtable != 0x00AF318C && vtable != 0x00AF3204) ||
+                !SecureValue(object + 0x0C, item.itemId)) return false;
+            if (vtable == 0x00AF310C) {
+                item.quantity = 1;
+                item.quantityKnown = true;
+            }
+            else if (vtable == 0x00AF318C) {
+                std::array<unsigned char, 8> data{};
+                if (!ReadAt(object + 0x28, data)) return false;
+                std::uint32_t checksum = 0xBAADF00D;
+                for (unsigned int index = 0; index < 2; ++index) {
+                    const auto mixed = data[index] ^ checksum;
+                    checksum = data[index + 2] + ((mixed >> 5) | (mixed << 27));
+                }
+                std::uint32_t expected = 0;
+                std::memcpy(&expected, data.data() + 4, sizeof(expected));
+                if (checksum != expected) return false;
+                item.quantity = (data[0] ^ data[2]) | ((data[1] ^ data[3]) << 8);
+                item.quantityKnown = true;
+            }
+            inventory.push_back(item);
+        }
+    }
+    return true;
+}
+
+std::uint64_t UnixMilliseconds() {
+    FILETIME fileTime{};
+    GetSystemTimeAsFileTime(&fileTime);
+    const auto ticks = (static_cast<std::uint64_t>(fileTime.dwHighDateTime) << 32) | fileTime.dwLowDateTime;
+    return (ticks - 116444736000000000ULL) / 10000;
+}
+
+bool BindingKey(unsigned char type, std::uint32_t id, unsigned int& key, std::string& error) {
+    std::uint32_t mapped = 0;
+    std::uint32_t input = 0;
+    std::uint32_t vtable = 0;
+    std::array<unsigned char, 89 * 5> table{};
+    if (!ReadAt(0x00BED5A0, mapped) || mapped == 0 || !ReadAt(mapped, vtable) ||
+        vtable != 0x00AF5650 || !ReadAt(mapped + 4, table) ||
+        !ReadAt(0x00BEC33C, input) || input == 0) {
+        error = "native_binding_unavailable";
+        return false;
+    }
+    for (unsigned int index = 0; index < 89; ++index) {
+        std::uint32_t actionId = 0;
+        std::memcpy(&actionId, table.data() + index * 5 + 1, sizeof(actionId));
+        if (table[index * 5] != type || actionId != id) continue;
+        // Extended navigation keys share the low seven DIK bits used by CFuncKeyMappedMan.
+        unsigned int scan = index;
+        if (index == 71 || index == 72 || index == 73 || index == 75 || index == 77 ||
+            index == 79 || index == 80 || index == 81 || index == 82 || index == 83) scan |= 0x80;
+        if (!ReadAt(input + 0x424 + scan * 4, key) || key == 0 || key > 255) continue;
+        return true;
+    }
+    error = type == 2 ? "unsupported: item_not_bound" : "unsupported: native_action_not_bound";
+    return false;
+}
+
 GameState CaptureState() {
     GameState state;
     ReadAt(0x00BEDED4, state.field);
     std::uint32_t stageType = 0;
     state.loginStage = state.field != 0 && ReadAt(state.field, stageType) && stageType == 0x00AF6B24;
-    if (state.field != 0) state.mapValid = SecureMap(state.field, state.map);
+    if (state.field != 0) state.mapValid = SecureValue(state.field + 0x138, state.map);
     std::uint32_t context = 0;
     if (ReadAt(0x00BE7918, context) && context != 0 &&
         ReadAt(context + 0x20B8, state.stats) && state.stats != 0) {
@@ -244,6 +319,10 @@ GameState CaptureState() {
     if (state.mapValid) {
         state.monstersValid = CaptureMonsters(state.monsters);
         if (!state.monstersValid) state.monsters.clear();
+    }
+    if (state.characterValid) {
+        state.inventoryValid = CaptureInventory(state.stats, state.inventory);
+        if (!state.inventoryValid) state.inventory.clear();
     }
     return state;
 }
@@ -348,16 +427,11 @@ bool ApplyDesiredKeys(const std::vector<unsigned int>& keys, unsigned int durati
 }
 
 bool Publish(const GameState& state) {
-    FILETIME fileTime{};
-    GetSystemTimeAsFileTime(&fileTime);
-    const std::uint64_t ticks = (static_cast<std::uint64_t>(fileTime.dwHighDateTime) << 32) |
-        fileTime.dwLowDateTime;
-    const std::uint64_t unixMs = (ticks - 116444736000000000ULL) / 10000;
     const bool ready = state.mapValid && state.characterValid && state.positionValid;
     std::ostringstream out;
     out << "{\"protocol\":1,\"instance_id\":" << Quote(instanceId)
         << ",\"pid\":" << GetCurrentProcessId() << ",\"run_id\":" << Quote(runId)
-        << ",\"seq\":" << ++sequence << ",\"observed_at_ms\":" << unixMs
+        << ",\"seq\":" << state.sequence << ",\"observed_at_ms\":" << state.observedAtMs
         << ",\"scene_generation\":" << sceneGeneration
         << ",\"ready\":" << (ready ? "true" : "false") << ",\"map_id\":";
     if (state.mapValid) out << state.map;
@@ -393,6 +467,22 @@ bool Publish(const GameState& state) {
             out << ",\"name\":" << (monster.name.empty() ? "null" : Quote(monster.name))
                 << ",\"x\":" << monster.x << ",\"y\":" << monster.y
                 << ",\"active\":" << (monster.active ? "true" : "false") << '}';
+        }
+        out << ']';
+    }
+    else out << "null";
+    out << ",\"backend\":\"beidou\",\"capabilities\":{\"move\":true,\"face\":true,\"jump\":true,\"attack\":true,\"pickup\":true,\"use_item\":true,\"stop\":true,\"raw_keys\":true,\"skill\":true,\"use_item_requires_binding\":true},\"inventory\":";
+    if (state.inventoryValid) {
+        out << '[';
+        bool separator = false;
+        for (const auto& item : state.inventory) {
+            if (separator) out << ',';
+            separator = true;
+            out << "{\"inventory_type\":" << item.inventoryType << ",\"slot\":" << item.slot
+                << ",\"item_id\":" << item.itemId << ",\"quantity\":";
+            if (item.quantityKnown) out << item.quantity;
+            else out << "null";
+            out << '}';
         }
         out << ']';
     }
@@ -437,12 +527,16 @@ bool Publish(const GameState& state) {
 
 void Tick() {
     const ULONGLONG now = GetTickCount64();
-    const GameState state = CaptureState();
+    GameState state = CaptureState();
     const bool changed = haveScene && (state.field != previousState.field ||
         state.stats != previousState.stats || state.mapValid != previousState.mapValid ||
         (state.mapValid && state.map != previousState.map) ||
         (state.characterValid && state.character.id != previousState.character.id));
     if (changed) ++sceneGeneration;
+    state.instanceId = instanceId;
+    state.sequence = ++sequence;
+    state.observedAtMs = UnixMilliseconds();
+    state.sceneGeneration = sceneGeneration;
     previousState = state;
     currentState = &previousState;
     haveScene = true;
@@ -611,6 +705,95 @@ bool AgentBridge::Install() {
     return true;
 }
 
+bool AgentBridge::SemanticAction(const MapleControl::Action& action, std::string& error) {
+    semanticResult = MapleControl::ActionResult{};
+    if (action.kind == MapleControl::ActionKind::Stop) {
+        semanticResult.dispatched = active;
+        semanticResult.reason = "stop_requested";
+        ScriptRelease();
+        return true;
+    }
+    unsigned int key = 0;
+    unsigned int duration = action.durationMs == 0 ? 60 : action.durationMs;
+    switch (action.kind) {
+    case MapleControl::ActionKind::Move:
+    case MapleControl::ActionKind::Face:
+        if (action.direction == "left") key = VK_LEFT;
+        else if (action.direction == "right") key = VK_RIGHT;
+        else if (action.direction == "up" && action.kind == MapleControl::ActionKind::Move) key = VK_UP;
+        else if (action.direction == "down" && action.kind == MapleControl::ActionKind::Move) key = VK_DOWN;
+        else { error = "unsupported: direction"; return false; }
+        if (action.kind == MapleControl::ActionKind::Face) {
+            if (currentState->facingValid && currentState->facingLeft == (key == VK_LEFT)) {
+                semanticResult.reason = "already_facing";
+                ScriptRelease();
+                return true;
+            }
+            duration = 30;
+        }
+        break;
+    case MapleControl::ActionKind::Jump:
+        if (!BindingKey(5, 51, key, error)) return false;
+        break;
+    case MapleControl::ActionKind::Attack:
+        if (!BindingKey(5, 52, key, error)) return false;
+        break;
+    case MapleControl::ActionKind::Pickup:
+        if (!BindingKey(5, 50, key, error)) return false;
+        break;
+    case MapleControl::ActionKind::UseItem:
+        if (!BindingKey(2, action.itemId, key, error)) return false;
+        break;
+    case MapleControl::ActionKind::Stop:
+        break;
+    }
+    if (!ScriptKeys({key}, duration, error)) return false;
+    semanticResult.dispatched = true;
+    semanticResult.reason = "native_input_dispatched";
+    return true;
+}
+
+MapleControl::ActionResult AgentBridge::SemanticResult() {
+    auto result = semanticResult;
+    result.controlReleased = ScriptReleased();
+    return result;
+}
+
+bool AgentBridge::ScriptRawKeys(const std::vector<std::string>& names, unsigned int duration,
+    std::string& error) {
+    struct NamedKey { const char* name; unsigned int code; };
+    static const NamedKey named[]{
+        {"Left", VK_LEFT}, {"Right", VK_RIGHT}, {"Up", VK_UP}, {"Down", VK_DOWN},
+        {"Control_L", VK_LCONTROL}, {"Control_R", VK_RCONTROL}, {"Ctrl", VK_LCONTROL},
+        {"Control", VK_LCONTROL}, {"Alt_L", VK_LMENU}, {"Alt_R", VK_RMENU}, {"Alt", VK_LMENU},
+        {"Shift_L", VK_LSHIFT}, {"Shift_R", VK_RSHIFT}, {"Shift", VK_LSHIFT},
+        {"space", VK_SPACE}, {"Return", VK_RETURN}, {"Escape", VK_ESCAPE}, {"Tab", VK_TAB},
+        {"Home", VK_HOME}, {"End", VK_END}, {"Prior", VK_PRIOR}, {"Next", VK_NEXT},
+        {"Insert", VK_INSERT}, {"Delete", VK_DELETE}, {"BackSpace", VK_BACK}
+    };
+    std::vector<unsigned int> keys;
+    for (const auto& name : names) {
+        unsigned int key = 0;
+        for (const auto& entry : named) if (name == entry.name) { key = entry.code; break; }
+        if (key == 0 && name.size() == 1) {
+            if (name[0] >= 'a' && name[0] <= 'z') key = name[0] - 'a' + 'A';
+            else if ((name[0] >= 'A' && name[0] <= 'Z') || (name[0] >= '0' && name[0] <= '9')) key = name[0];
+        }
+        if (key == 0 && name.size() >= 2 && name.size() <= 3 && name[0] == 'F' &&
+            name[1] >= '1' && name[1] <= '9') {
+            unsigned int number = name[1] - '0';
+            if (name.size() == 3) {
+                if (name[2] < '0' || name[2] > '9') { error = "unsupported: raw_key"; return false; }
+                number = number * 10 + name[2] - '0';
+            }
+            if (number <= 12) key = VK_F1 + number - 1;
+        }
+        if (key == 0) { error = "unsupported: raw_key"; return false; }
+        keys.push_back(key);
+    }
+    return ScriptKeys(keys, duration, error);
+}
+
 bool AgentBridge::ScriptKeys(const std::vector<unsigned int>& keys, unsigned int durationMs, std::string& error) {
     inputOwner = InputOwner::Script;
     return ApplyDesiredKeys(keys, durationMs, error);
@@ -654,7 +837,7 @@ bool AgentBridge::InvokeSkill(std::uint32_t skillId, int& result, std::string& e
     return true;
 }
 
-void AgentBridge::ScriptLogs(const std::string& scriptId, const std::vector<std::string>& lines) {
+bool AgentBridge::ScriptLogs(const std::string& scriptId, const std::vector<std::string>& lines) {
     std::ostringstream records;
     for (const auto& line : lines) records << "{\"script_id\":" << Quote(scriptId)
         << ",\"at_ms\":" << GetTickCount64() << ",\"text\":" << Quote(line) << "}\n";
@@ -662,12 +845,11 @@ void AgentBridge::ScriptLogs(const std::string& scriptId, const std::vector<std:
     const HANDLE file = CreateFileA((directory + "\\script-events.jsonl").c_str(), FILE_APPEND_DATA,
         FILE_SHARE_READ | FILE_SHARE_DELETE, nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (file == INVALID_HANDLE_VALUE) {
-        LuaController::Cancel("script_log_unavailable");
-        return;
+        return false;
     }
     DWORD written = 0;
     const bool complete = WriteFile(file, bytes.data(), static_cast<DWORD>(bytes.size()), &written,
         nullptr) && written == bytes.size();
     CloseHandle(file);
-    if (!complete) LuaController::Cancel("script_log_write_failed");
+    return complete;
 }

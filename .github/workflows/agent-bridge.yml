@@ -10,6 +10,7 @@ on:
       - ezorsia/**
       - detours/**
       - third_party/**
+      - shared/**
       - ezorsia.sln
       - tools/build-agent-bridge.ps1
       - .github/workflows/agent-bridge.yml
@@ -18,6 +19,7 @@ on:
       - ezorsia/**
       - detours/**
       - third_party/**
+      - shared/**
       - ezorsia.sln
       - tools/build-agent-bridge.ps1
       - .github/workflows/agent-bridge.yml
