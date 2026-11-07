@@ -632,6 +632,10 @@ bool AgentBridge::ScriptReleased() {
     return !active && !releasing;
 }
 
+bool AgentBridge::ScriptReleasePending() {
+    return releasing;
+}
+
 bool AgentBridge::InvokeSkill(std::uint32_t skillId, int& result, std::string& error) {
     if (!currentState->mapValid || !currentState->characterValid || !currentState->positionValid ||
         currentState->character.values[6] == 0) {

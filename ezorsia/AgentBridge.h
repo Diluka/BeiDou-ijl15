@@ -45,6 +45,7 @@ namespace AgentBridge {
     bool ScriptKeys(const std::vector<unsigned int>& keys, unsigned int durationMs, std::string& error);
     void ScriptRelease();
     bool ScriptReleased();
+    bool ScriptReleasePending();
     bool InvokeSkill(std::uint32_t skillId, int& result, std::string& error);
     void ScriptLogs(const std::string& scriptId, const std::vector<std::string>& lines);
 }

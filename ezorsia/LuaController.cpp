@@ -344,6 +344,7 @@ void LuaController::Tick(const AgentBridge::GameState& state, std::uint64_t gene
         return;
     }
     if (sceneChanged) return;
+    if (AgentBridge::ScriptReleasePending()) return;
     if (runtime.wait == WaitFor::Sleep && now < runtime.wakeAt) return;
     if (runtime.wait == WaitFor::Keys && !AgentBridge::ScriptReleased()) return;
     runtime.wait = WaitFor::None;
