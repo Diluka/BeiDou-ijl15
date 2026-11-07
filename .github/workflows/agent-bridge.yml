@@ -9,6 +9,7 @@ on:
     paths:
       - ezorsia/**
       - detours/**
+      - third_party/**
       - ezorsia.sln
       - tools/build-agent-bridge.ps1
       - .github/workflows/agent-bridge.yml
@@ -16,6 +17,7 @@ on:
     paths:
       - ezorsia/**
       - detours/**
+      - third_party/**
       - ezorsia.sln
       - tools/build-agent-bridge.ps1
       - .github/workflows/agent-bridge.yml

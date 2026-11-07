@@ -77,6 +77,11 @@ if (Test-Path 'out/Release/ijl15.pdb') {
 }
 Copy-Item LICENSE "$package/LICENSE"
 Copy-Item 'out/build.log' "$package/build.log"
+$luaSource = Get-Content -Raw 'third_party/lua/source.json' | ConvertFrom-Json
+New-Item -ItemType Directory -Force "$package/licenses/lua" | Out-Null
+Copy-Item 'third_party/lua/LICENSE' "$package/licenses/lua/LICENSE"
+Copy-Item 'third_party/lua/NOTICE.md' "$package/licenses/lua/NOTICE.md"
+Copy-Item 'third_party/lua/source.json' "$package/licenses/lua/source.json"
 $exports | Set-Content -Encoding utf8 "$package/exports.txt"
 $dependencies | Set-Content -Encoding utf8 "$package/dependencies.txt"
 
@@ -111,6 +116,15 @@ $manifest = [ordered]@{
         source_charset_without_bom = 'CP936'
         execution_charset = 'CP936'
         detours_lib_sha256 = (Get-FileHash 'detours/detours.lib' -Algorithm SHA256).Hash.ToLowerInvariant()
+    }
+    dependencies = [ordered]@{
+        lua = [ordered]@{
+            version = $luaSource.version
+            source_url = $luaSource.url
+            archive_sha256 = $luaSource.sha256
+            license = 'MIT'
+            linkage = 'compiled-as-C-into-ijl15'
+        }
     }
     ci = [ordered]@{
         workflow = $env:GITHUB_WORKFLOW

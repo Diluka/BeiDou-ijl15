@@ -1,5 +1,6 @@
 #include "stdafx.h"
 #include "AgentBridge.h"
+#include "LuaController.h"
 
 #include <array>
 #include <cstdint>
@@ -19,30 +20,16 @@ using ApplicationUpdate = void(__thiscall*)(ClientApplication*, int);
 using KeyPressed = unsigned int(__thiscall*)(InputSystem*, int);
 using InputModifiers = unsigned int(__thiscall*)(InputSystem*);
 using InputMessage = void(__stdcall*)(unsigned int, unsigned int, unsigned int);
+struct ClientPlayer;
+using ActiveSkill = int(__thiscall*)(ClientPlayer*, int, int, int*);
 
 auto originalUpdate = reinterpret_cast<ApplicationUpdate>(0x009F84D0);
 auto originalKeyPressed = reinterpret_cast<KeyPressed>(0x0059A25A);
 const auto dispatchInput = reinterpret_cast<InputMessage>(0x009F97B7);
 const auto inputModifiers = reinterpret_cast<InputModifiers>(0x0059B1EB);
+const auto activeSkill = reinterpret_cast<ActiveSkill>(0x00966F7A);
 
-struct CharacterState {
-    std::uint32_t id = 0;
-    std::string name;
-    std::array<std::uint32_t, 13> values{};
-};
-
-struct GameState {
-    std::uint32_t field = 0;
-    std::uint32_t stats = 0;
-    std::uint32_t user = 0;
-    std::uint32_t map = 0;
-    CharacterState character;
-    int x = 0;
-    int y = 0;
-    bool mapValid = false;
-    bool characterValid = false;
-    bool positionValid = false;
-};
+using AgentBridge::GameState;
 
 std::string directory;
 std::string instanceId;
@@ -58,7 +45,22 @@ std::string pendingReason;
 std::array<bool, 256> held{};
 std::array<bool, 256> owned{};
 std::array<unsigned int, 256> scanCodes{};
+std::array<std::uint32_t, 256> nativeScanCodes{};
+std::uint32_t nativeScanCodesOwner = 0;
+enum class InputOwner { None, External, Script };
+InputOwner inputOwner = InputOwner::None;
 bool active = false;
+bool scriptCommand = false;
+bool haveSkillResult = false;
+std::uint32_t lastSkillId = 0;
+int lastSkillResult = 0;
+const GameState* currentState = nullptr;
+std::uint32_t controlledCharacter = 0;
+std::uint32_t updatedCharacter = 0;
+std::uint32_t releaseCharacter = 0;
+std::uint64_t characterUpdates = 0;
+std::uint64_t releaseAtCharacterUpdate = 0;
+bool releaseNeedsCharacterUpdate = false;
 bool releasing = false;
 bool haveScene = false;
 GameState previousState;
@@ -124,9 +126,65 @@ bool SecureMap(std::uint32_t field, std::uint32_t& map) {
     return guards[0] == encrypted[5] && guards[4] == encrypted[6] && checksum == expected;
 }
 
+bool SecureInteger(std::uintptr_t address, std::uint32_t& value) {
+    std::array<std::uint32_t, 3> data{};
+    if (!ReadAt(address, data)) return false;
+    const std::uint32_t mixed = data[0] ^ 0xBAADF00D;
+    const std::uint32_t checksum = data[1] + ((mixed >> 5) | (mixed << 27));
+    value = data[0] ^ ((data[1] << 5) | (data[1] >> 27));
+    return checksum == data[2];
+}
+
+bool CaptureMonsters(std::vector<AgentBridge::MonsterState>& monsters) {
+    std::uint32_t pool = 0;
+    std::uint32_t vtable = 0;
+    std::array<std::uint32_t, 3> membership{};
+    if (!ReadAt(0x00BEBFA4, pool) || pool == 0 || !ReadAt(pool, vtable) ||
+        vtable != 0x00AF8378 || !ReadAt(pool + 0x24, membership) || membership[0] > 512) return false;
+    auto position = membership[1];
+    while (position != 0 && monsters.size() < membership[0]) {
+        std::uint32_t object = 0;
+        std::array<std::uint32_t, 3> vtables{};
+        std::array<int, 2> coordinates{};
+        std::uint32_t entry = 0;
+        AgentBridge::MonsterState monster;
+        std::uint32_t activeValue = 0;
+        if (!ReadAt(position + 4, object) || object == 0 || !ReadAt(object, vtables) ||
+            vtables != std::array<std::uint32_t, 3>{0x00AF8270, 0x00AF824C, 0x00AF8248} ||
+            !ReadAt(object + 0x510, coordinates) || !SecureInteger(object + 0x17C, monster.objectId) ||
+            !SecureInteger(object + 0x124, activeValue) || !ReadAt(object + 0x188, entry)) return false;
+        monster.x = coordinates[0];
+        monster.y = coordinates[1];
+        monster.active = activeValue != 0;
+        if (entry != 0) {
+            if (!SecureInteger(entry + 0x0C, monster.templateId)) return false;
+            monster.templateValid = true;
+            std::uint32_t name = 0;
+            std::uint32_t nameLength = 0;
+            if (ReadAt(entry + 0x30, name) && name != 0 && ReadAt(name - 4, nameLength) &&
+                nameLength > 0 && nameLength <= 512) {
+                std::array<char, 513> bytes{};
+                SIZE_T read = 0;
+                if (ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<LPCVOID>(name), bytes.data(),
+                    nameLength + 1, &read) && read == nameLength + 1 && bytes[nameLength] == 0)
+                    monster.name = Utf8Name(bytes.data(), static_cast<int>(nameLength));
+            }
+        }
+        monsters.push_back(monster);
+        std::uint32_t node = 0;
+        if (!ReadAt(position - 12, node)) return false;
+        position = node == 0 ? 0 : node + 16;
+    }
+    std::array<std::uint32_t, 3> after{};
+    return position == 0 && monsters.size() == membership[0] && ReadAt(pool + 0x24, after) &&
+        after == membership;
+}
+
 GameState CaptureState() {
     GameState state;
     ReadAt(0x00BEDED4, state.field);
+    std::uint32_t stageType = 0;
+    state.loginStage = state.field != 0 && ReadAt(state.field, stageType) && stageType == 0x00AF6B24;
     if (state.field != 0) state.mapValid = SecureMap(state.field, state.map);
     std::uint32_t context = 0;
     if (ReadAt(0x00BE7918, context) && context != 0 &&
@@ -178,7 +236,14 @@ GameState CaptureState() {
         if (state.positionValid) {
             state.x = position[0];
             state.y = position[1];
+            std::uint32_t facing = 0;
+            state.facingValid = ReadAt(state.user + 0x570, facing);
+            state.facingLeft = (facing & 1) != 0;
         }
+    }
+    if (state.mapValid) {
+        state.monstersValid = CaptureMonsters(state.monsters);
+        if (!state.monstersValid) state.monsters.clear();
     }
     return state;
 }
@@ -214,6 +279,10 @@ bool SendKey(unsigned int key, bool down) {
 }
 
 void BeginRelease(const std::string& status, const std::string& reason) {
+    releaseNeedsCharacterUpdate = false;
+    for (bool key : owned) releaseNeedsCharacterUpdate = releaseNeedsCharacterUpdate || key;
+    releaseCharacter = controlledCharacter;
+    releaseAtCharacterUpdate = characterUpdates;
     for (unsigned int key = 0; key < held.size(); ++key) if (held[key]) {
         held[key] = false;
         SendKey(key, false);
@@ -222,6 +291,60 @@ void BeginRelease(const std::string& status, const std::string& reason) {
     releasing = true;
     pendingStatus = status;
     pendingReason = reason;
+}
+
+bool ApplyDesiredKeys(const std::vector<unsigned int>& keys, unsigned int durationMs, std::string& error) {
+    if (keys.empty()) {
+        BeginRelease({}, {});
+        return true;
+    }
+    if (!currentState->mapValid || !currentState->characterValid || !currentState->positionValid ||
+        currentState->character.values[6] == 0) {
+        error = "state_unavailable_or_dead";
+        return false;
+    }
+    std::uint32_t input = 0;
+    if (!ReadAt(0x00BEC33C, input) || input == 0) {
+        error = "input_route_unavailable";
+        return false;
+    }
+    if (nativeScanCodesOwner != input) {
+        if (!ReadAt(input + 0x24, nativeScanCodes)) {
+            error = "input_key_map_unavailable";
+            return false;
+        }
+        nativeScanCodesOwner = input;
+    }
+    std::array<bool, 256> desired{};
+    for (unsigned int key : keys) {
+        if (key == 0 || key > 255 || nativeScanCodes[key] == 0 || nativeScanCodes[key] > 255) {
+            error = "unsupported_native_key";
+            return false;
+        }
+        desired[key] = true;
+        scanCodes[key] = nativeScanCodes[key];
+    }
+    // A nonblocking Lua keys update replaces the desired set without flickering unchanged keys.
+    releasing = false;
+    pendingStatus.clear();
+    pendingReason.clear();
+    for (unsigned int key = 0; key < held.size(); ++key) if (held[key] && !desired[key]) {
+        held[key] = false;
+        SendKey(key, false);
+    }
+    for (unsigned int key = 0; key < held.size(); ++key) if (!held[key] && desired[key]) {
+        owned[key] = true;
+        held[key] = true;
+        if (!SendKey(key, true)) {
+            BeginRelease({}, {});
+            error = "input_route_unavailable";
+            return false;
+        }
+    }
+    active = true;
+    controlledCharacter = currentState->user;
+    deadline = GetTickCount64() + durationMs;
+    return true;
 }
 
 bool Publish(const GameState& state) {
@@ -254,6 +377,26 @@ bool Publish(const GameState& state) {
     out << ",\"position\":";
     if (state.positionValid) out << "{\"x\":" << state.x << ",\"y\":" << state.y << '}';
     else out << "null";
+    out << ",\"facing\":";
+    if (state.facingValid) out << Quote(state.facingLeft ? "Left" : "Right");
+    else out << "null";
+    out << ",\"monsters\":";
+    if (state.monstersValid) {
+        out << '[';
+        bool separator = false;
+        for (const auto& monster : state.monsters) {
+            if (separator) out << ',';
+            separator = true;
+            out << "{\"object_id\":" << monster.objectId << ",\"template_id\":";
+            if (monster.templateValid) out << monster.templateId;
+            else out << "null";
+            out << ",\"name\":" << (monster.name.empty() ? "null" : Quote(monster.name))
+                << ",\"x\":" << monster.x << ",\"y\":" << monster.y
+                << ",\"active\":" << (monster.active ? "true" : "false") << '}';
+        }
+        out << ']';
+    }
+    else out << "null";
     out << ",\"held_keys\":[";
     bool separator = false;
     for (unsigned int key = 0; key < held.size(); ++key) if (held[key]) {
@@ -267,6 +410,17 @@ bool Publish(const GameState& state) {
     if (rejectedReason.empty()) out << "null";
     else out << "{\"id\":" << (rejectedId.empty() ? "null" : Quote(rejectedId))
         << ",\"status\":\"rejected\",\"reason\":" << Quote(rejectedReason) << '}';
+    out << ",\"script\":";
+    const auto* script = LuaController::CurrentStatus();
+    if (script == nullptr) out << "null";
+    else out << "{\"id\":" << Quote(script->id) << ",\"status\":" << Quote(script->status)
+        << ",\"reason\":" << (script->reason.empty() ? "null" : Quote(script->reason))
+        << ",\"error\":" << (script->error.empty() ? "null" : Quote(script->error))
+        << ",\"resumes\":" << script->resumes << ",\"budget_yields\":" << script->budgetYields
+        << ",\"last_resume_us\":" << script->lastResumeUs << ",\"max_resume_us\":" << script->maxResumeUs << '}';
+    out << ",\"last_skill\":";
+    if (haveSkillResult) out << "{\"skill_id\":" << lastSkillId << ",\"native_result\":" << lastSkillResult << '}';
+    else out << "null";
     out << ",\"input_events\":" << inputEvents << "}\n";
     const std::string bytes = out.str();
     const std::string temporary = directory + "\\state.tmp";
@@ -290,19 +444,36 @@ void Tick() {
         (state.characterValid && state.character.id != previousState.character.id));
     if (changed) ++sceneGeneration;
     previousState = state;
+    currentState = &previousState;
     haveScene = true;
 
-    // A release is complete only after the original game update has observed the cleared keys.
-    if (releasing) {
+    // CallUpdate may return without advancing its 30ms character step. Confirm the actual consumer.
+    const bool characterConsumedRelease = updatedCharacter == releaseCharacter &&
+        characterUpdates > releaseAtCharacterUpdate;
+    const bool oldCharacterExited = state.loginStage ||
+        (state.field == 0 && state.stats == 0 && state.user == 0) ||
+        (state.characterValid && state.positionValid && state.user != releaseCharacter);
+    if (releasing && (!releaseNeedsCharacterUpdate || characterConsumedRelease || oldCharacterExited)) {
         releasing = false;
         owned.fill(false);
-        commandStatus = pendingStatus;
-        commandReason = pendingReason;
+        inputOwner = InputOwner::None;
+        controlledCharacter = 0;
+        if (!pendingStatus.empty()) {
+            commandStatus = pendingStatus;
+            commandReason = pendingReason;
+        }
+        pendingStatus.clear();
+        pendingReason.clear();
     }
     const bool ready = state.mapValid && state.characterValid && state.positionValid;
-    if (active && (changed || !ready || state.character.values[6] == 0))
-        BeginRelease("cancelled", changed ? "scene_changed" : !ready ? "state_unavailable" : "dead");
-    else if (active && now >= deadline) BeginRelease("completed", "duration_elapsed");
+    if (active && (changed || !ready || state.character.values[6] == 0)) {
+        if (inputOwner == InputOwner::Script) BeginRelease({}, {});
+        else BeginRelease("cancelled", changed ? "scene_changed" : !ready ? "state_unavailable" : "dead");
+    }
+    else if (active && now >= deadline) {
+        if (inputOwner == InputOwner::Script) BeginRelease({}, {});
+        else BeginRelease("completed", "duration_elapsed");
+    }
 
     const std::string requestPath = directory + "\\command.txt";
     const HANDLE request = CreateFileA(requestPath.c_str(), GENERIC_READ, FILE_SHARE_READ |
@@ -315,13 +486,13 @@ void Tick() {
         DeleteFileA(requestPath.c_str());
         unsigned int protocol = 0;
         std::uint64_t generation = 0;
-        unsigned int duration = 0;
+        unsigned int value = 0;
         std::string targetInstance;
         std::string id;
         std::string operation;
         std::istringstream command(std::string(buffer.data(), bytes));
         const bool header = read && bytes < 1024 &&
-            static_cast<bool>(command >> protocol >> targetInstance >> generation >> id >> operation >> duration);
+            static_cast<bool>(command >> protocol >> targetInstance >> generation >> id >> operation >> value);
         if (!header) {
             rejectedId = id;
             rejectedReason = "invalid_command";
@@ -331,29 +502,32 @@ void Tick() {
             rejectedId.clear();
             rejectedReason.clear();
             std::vector<unsigned int> keys;
-            unsigned int key = 0;
-            while (command >> key) keys.push_back(key);
-            bool valid = command.eof() && protocol == 1 && targetInstance == instanceId &&
+            std::string scriptId;
+            bool valid = protocol == 1 && targetInstance == instanceId &&
                 !id.empty() && id.size() <= 64 && id.find_first_not_of("0123456789abcdefABCDEF-") == std::string::npos;
-            std::uint32_t input = 0;
             if (operation == "keys") {
-                valid = valid && generation == sceneGeneration && duration >= 1 && duration <= 30000 &&
-                    !keys.empty() && keys.size() <= 16 && ready && state.character.values[6] != 0 &&
-                    ReadAt(0x00BEC33C, input) && input != 0;
-                for (unsigned int candidate : keys) {
-                    std::uint32_t scan = 0;
-                    if (candidate > 255 || candidate == 0 ||
-                        !ReadAt(input + 0x24 + candidate * 4, scan) || scan == 0 || scan > 255) valid = false;
-                    else scanCodes[candidate] = scan;
-                }
+                unsigned int key = 0;
+                while (command >> key) keys.push_back(key);
+                valid = valid && command.eof() && generation == sceneGeneration &&
+                    value >= 1 && value <= 30000 && !keys.empty() && keys.size() <= 16 &&
+                    ready && state.character.values[6] != 0;
             }
-            else valid = valid && operation == "stop" && duration == 0 && keys.empty();
-
-            if (!valid || (operation == "keys" && (active || releasing))) {
-                // Callers serialize mutations with maple's input lock. A rejected request never presses keys.
+            else {
+                if (operation == "script") command >> scriptId;
+                std::string extra;
+                const bool hasExtra = static_cast<bool>(command >> extra);
+                if (operation == "script") valid = valid && !hasExtra && generation == sceneGeneration &&
+                    scriptId.size() == 32 && scriptId.find_first_not_of("0123456789abcdefABCDEF") == std::string::npos &&
+                    ready && state.character.values[6] != 0;
+                else if (operation == "skill") valid = valid && !hasExtra && generation == sceneGeneration &&
+                    value >= 1 && value <= 2147483647 && ready && state.character.values[6] != 0;
+                else valid = valid && operation == "stop" && value == 0 && !hasExtra;
+            }
+            const bool busy = operation != "stop" && (active || releasing || LuaController::Running());
+            if (!valid || busy) {
                 rejectedId = id;
                 rejectedReason = valid ? "busy" : "invalid_or_stale_command";
-                if (!active && !releasing) {
+                if (!active && !releasing && !LuaController::Running()) {
                     commandId = id;
                     commandStatus = "rejected";
                     commandReason = rejectedReason;
@@ -363,25 +537,46 @@ void Tick() {
                 commandId = id;
                 commandStatus = "running";
                 commandReason.clear();
-                if (operation == "stop") BeginRelease("completed", "stopped");
-                else {
-                    deadline = now + duration;
-                    active = true;
-                    for (unsigned int candidate : keys) {
-                        if (held[candidate]) continue;
-                        owned[candidate] = true;
-                        held[candidate] = true;
-                        if (!SendKey(candidate, true)) {
-                            BeginRelease("cancelled", "input_route_unavailable");
-                            break;
-                        }
+                if (operation == "stop") {
+                    LuaController::Cancel("stopped");
+                    scriptCommand = false;
+                    BeginRelease("completed", "stopped");
+                }
+                else if (operation == "script") {
+                    std::string error;
+                    scriptCommand = LuaController::Start(scriptId, directory + "\\scripts\\" + scriptId + ".lua",
+                        value, state, sceneGeneration, error);
+                    if (!scriptCommand) {
+                        commandStatus = "rejected";
+                        commandReason = "script_load_error";
                     }
+                }
+                else if (operation == "skill") {
+                    int result = 0;
+                    std::string error;
+                    if (!AgentBridge::InvokeSkill(value, result, error)) BeginRelease("rejected", error);
+                    else BeginRelease("completed", "native_returned");
+                }
+                else {
+                    inputOwner = InputOwner::External;
+                    std::string error;
+                    if (!ApplyDesiredKeys(keys, value, error)) BeginRelease("rejected", error);
                 }
             }
         }
     }
+    LuaController::Tick(state, sceneGeneration, changed);
+    if (scriptCommand && !LuaController::Running()) {
+        const auto* script = LuaController::CurrentStatus();
+        commandStatus = script->status;
+        commandReason = script->reason;
+        scriptCommand = false;
+    }
     if (now - lastPublishedAt >= 25) {
-        if (!Publish(state) && active) BeginRelease("cancelled", "state_publish_failed");
+        if (!Publish(state)) {
+            if (LuaController::Running()) LuaController::Cancel("state_publish_failed");
+            else if (active) BeginRelease("cancelled", "state_publish_failed");
+        }
         lastPublishedAt = now;
     }
 }
@@ -414,4 +609,61 @@ bool AgentBridge::Install() {
         return false;
     }
     return true;
+}
+
+bool AgentBridge::ScriptKeys(const std::vector<unsigned int>& keys, unsigned int durationMs, std::string& error) {
+    inputOwner = InputOwner::Script;
+    return ApplyDesiredKeys(keys, durationMs, error);
+}
+
+void AgentBridge::CharacterUpdated(std::uintptr_t player) {
+    std::uint32_t current = 0;
+    if (ReadAt(0x00BEBF98, current) && current == player) {
+        updatedCharacter = current;
+        ++characterUpdates;
+    }
+}
+
+void AgentBridge::ScriptRelease() {
+    BeginRelease({}, {});
+}
+
+bool AgentBridge::ScriptReleased() {
+    return !active && !releasing;
+}
+
+bool AgentBridge::InvokeSkill(std::uint32_t skillId, int& result, std::string& error) {
+    if (!currentState->mapValid || !currentState->characterValid || !currentState->positionValid ||
+        currentState->character.values[6] == 0) {
+        error = "state_unavailable_or_dead";
+        return false;
+    }
+    std::uint32_t player = 0;
+    if (!ReadAt(0x00BEBF98, player) || player != currentState->user) {
+        error = "character_changed";
+        return false;
+    }
+    result = activeSkill(reinterpret_cast<ClientPlayer*>(player), static_cast<int>(skillId), 0, nullptr);
+    haveSkillResult = true;
+    lastSkillId = skillId;
+    lastSkillResult = result;
+    return true;
+}
+
+void AgentBridge::ScriptLogs(const std::string& scriptId, const std::vector<std::string>& lines) {
+    std::ostringstream records;
+    for (const auto& line : lines) records << "{\"script_id\":" << Quote(scriptId)
+        << ",\"at_ms\":" << GetTickCount64() << ",\"text\":" << Quote(line) << "}\n";
+    const std::string bytes = records.str();
+    const HANDLE file = CreateFileA((directory + "\\script-events.jsonl").c_str(), FILE_APPEND_DATA,
+        FILE_SHARE_READ | FILE_SHARE_DELETE, nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (file == INVALID_HANDLE_VALUE) {
+        LuaController::Cancel("script_log_unavailable");
+        return;
+    }
+    DWORD written = 0;
+    const bool complete = WriteFile(file, bytes.data(), static_cast<DWORD>(bytes.size()), &written,
+        nullptr) && written == bytes.size();
+    CloseHandle(file);
+    if (!complete) LuaController::Cancel("script_log_write_failed");
 }

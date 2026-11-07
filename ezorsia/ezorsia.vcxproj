@@ -167,11 +167,23 @@
       <GenerateDebugInformation>true</GenerateDebugInformation>
     </Link>
   </ItemDefinitionGroup>
+  <ItemDefinitionGroup>
+    <ClCompile>
+      <AdditionalIncludeDirectories>$(ProjectDir)..\third_party\lua\src;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+    </ClCompile>
+  </ItemDefinitionGroup>
+  <ItemGroup>
+    <ClCompile Include="..\third_party\lua\src\*.c" Exclude="..\third_party\lua\src\lua.c;..\third_party\lua\src\luac.c">
+      <PrecompiledHeader>NotUsing</PrecompiledHeader>
+      <CompileAs>CompileAsC</CompileAs>
+    </ClCompile>
+  </ItemGroup>
   <ItemGroup>
     <ClInclude Include="AddyLocations.h">
       <FileType>CppHeader</FileType>
     </ClInclude>
     <ClInclude Include="AgentBridge.h" />
+    <ClInclude Include="LuaController.h" />
     <ClInclude Include="BossHP.h" />
     <ClInclude Include="HpMpAlert.h" />
     <ClInclude Include="Client.h" />
@@ -213,6 +225,7 @@
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="AgentBridge.cpp" />
+    <ClCompile Include="LuaController.cpp" />
     <ClCompile Include="BossHP.cpp" />
     <ClCompile Include="HpMpAlert.cpp" />
     <ClCompile Include="Client.cpp" />
