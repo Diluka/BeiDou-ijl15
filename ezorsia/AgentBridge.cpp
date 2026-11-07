@@ -511,6 +511,14 @@ bool Publish(const GameState& state) {
     out << ",\"last_skill\":";
     if (haveSkillResult) out << "{\"skill_id\":" << lastSkillId << ",\"native_result\":" << lastSkillResult << '}';
     else out << "null";
+    const auto actionResult = AgentBridge::SemanticResult();
+    out << ",\"action_result\":{\"dispatched\":" << (actionResult.dispatched ? "true" : "false")
+        << ",\"control_released\":" << (actionResult.controlReleased ? "true" : "false")
+        << ",\"settled\":";
+    if (actionResult.settled == MapleControl::Fact::Unknown) out << "null";
+    else out << (actionResult.settled == MapleControl::Fact::True ? "true" : "false");
+    out << ",\"effect\":" << Quote(actionResult.effect)
+        << ",\"reason\":" << Quote(actionResult.reason) << '}';
     out << ",\"input_events\":" << inputEvents << "}\n";
     const std::string bytes = out.str();
     const std::string temporary = directory + "\\state.tmp";
