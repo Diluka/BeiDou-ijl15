@@ -184,6 +184,7 @@
     </ClInclude>
     <ClInclude Include="AgentBridge.h" />
     <ClInclude Include="LuaController.h" />
+    <ClInclude Include="NativeObservation.h" />
     <ClInclude Include="..\shared\control\Runtime.h" />
     <ClInclude Include="BossHP.h" />
     <ClInclude Include="HpMpAlert.h" />
@@ -227,6 +228,10 @@
   <ItemGroup>
     <ClCompile Include="AgentBridge.cpp" />
     <ClCompile Include="LuaController.cpp" />
+    <ClCompile Include="NativeObservation.cpp" />
+    <ClCompile Include="ObserveWorld.cpp" />
+    <ClCompile Include="ObserveCharacter.cpp" />
+    <ClCompile Include="ObserveUi.cpp" />
     <ClCompile Include="..\shared\control\Runtime.cpp"><PrecompiledHeader>NotUsing</PrecompiledHeader></ClCompile>
     <ClCompile Include="BossHP.cpp" />
     <ClCompile Include="HpMpAlert.cpp" />

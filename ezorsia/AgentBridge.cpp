@@ -1,5 +1,6 @@
 #include "stdafx.h"
 #include "AgentBridge.h"
+#include "NativeObservation.h"
 #include "LuaController.h"
 
 #include <array>
@@ -674,6 +675,7 @@ void Tick() {
         commandReason = script->reason;
         scriptCommand = false;
     }
+    NativeObservation::Tick(directory, instanceId, runId, sceneGeneration, sequence);
     if (now - lastPublishedAt >= 25) {
         if (!Publish(state)) {
             if (LuaController::Running()) LuaController::Cancel("state_publish_failed");
